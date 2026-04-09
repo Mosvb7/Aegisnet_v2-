@@ -1,0 +1,34 @@
+# ─────────────────────────────────────────────
+#  AegisNet SOC — Python Dependencies
+#  Install with:  pip install -r requirements.txt
+#  Requires:      Python 3.11+  |  Linux (Ubuntu/Debian recommended)
+# ─────────────────────────────────────────────
+
+# ── Core engine (realengine.py) ───────────────
+flask>=3.0              # REST API server
+scapy>=2.5              # Packet sniffing, ARP scan, TCP flag inspection
+scikit-learn>=1.4       # IsolationForest anomaly detection
+pandas>=2.0             # Training data + flow stats
+numpy>=1.26             # Array ops for AI model
+requests>=2.31          # Geolocation API calls (ip-api.com / ipinfo.io)
+
+# ── Dashboard (scandash.py) ───────────────────
+streamlit>=1.35
+streamlit-autorefresh>=1.0   # Auto-refresh every 5 s
+streamlit-folium>=0.20       # Folium map widget inside Streamlit
+plotly>=5.20                 # Interactive charts + scatter mapbox
+folium>=0.16                 # Leaflet.js map for device/attacker pins
+
+# ── Log watcher (logwatch.py) ─────────────────
+# No extra dependencies — uses only `requests` (already listed above)
+# and Python stdlib: re, time, socket
+
+# ── Remote sensor (netcapture.py) ─────────────
+# No extra dependencies — uses scapy + requests (already listed above)
+
+# ── Optional: offline geolocation ─────────────
+# Replaces ip-api.com with a local MaxMind DB (no internet needed,
+# no rate limit). Download the free GeoLite2-City.mmdb from:
+#   https://dev.maxmind.com/geoip/geolite2-free-geolocation-data
+# Then set GEOIP_DB_PATH in realengine.py to the file path.
+geoip2>=4.8
