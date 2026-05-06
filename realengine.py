@@ -32,8 +32,8 @@ from sklearn.ensemble import IsolationForest
 
 # ── CONFIGURATION ────────────────────────────────────────────────────────────
 
-SNIFF_INTERFACE       = "any"           # eth0 / wlan0 / any
-LAN_SUBNET            = "192.168.1.0/24"
+SNIFF_INTERFACE       = "en0"           # active macOS interface / depend on current OS
+LAN_SUBNET            = "" # local network subnet
 GEOIP_DB_PATH          = "geoip_db/GeoLite2-City.mmdb"  # Local project database path
 FLOW_WINDOW           = 5               # seconds per flow bucket
 PORT_SCAN_THRESHOLD   = 10              # distinct ports → scan alert
@@ -42,15 +42,16 @@ DDOS_PKT_THRESHOLD    = 1000            # packets per FLOW_WINDOW → DDoS
 BRUTE_FORCE_THRESHOLD = 5              # failed logins in BRUTE_WINDOW s
 BRUTE_WINDOW          = 60
 BLOCK_COOLDOWN        = 60              # seconds before re-blocking same IP
-API_PORT              = 5000
+API_PORT              = 5050  # was 5000
 
 # IMPORTANT: Edit this list before running on your network.
 # Any IP here will NEVER be auto-blocked by the engine.
 IP_WHITELIST: set = {
     "127.0.0.1",
-    "192.168.1.1",    # <- your gateway / router
-    "192.168.1.255",  # broadcast
+    "192.168.0.170",     # <- your gateway / local network IP
 }
+# "10.39.1.1",      # <- your gateway / local network IP
+    # "10.39.1.255",    # broadcast
 
 # ── BOOT ─────────────────────────────────────────────────────────────────────
 
@@ -92,6 +93,17 @@ with db_lock:
     c.execute("""CREATE TABLE IF NOT EXISTS login_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT, source_ip TEXT, service TEXT, username TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS browsing_activity (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT,
+        source_ip TEXT,
+        domain TEXT,
+        query_type TEXT,
+        dst_ip TEXT,
+        dst_port INTEGER,
+        protocol TEXT,
+        url_hint TEXT
     )""")
     conn.commit()
 print("[OK]  Database ready:", DB_PATH)
@@ -447,6 +459,172 @@ def worker():
             _anal_queue.task_done()
         except Empty: continue
 
+# ── BROWSING TRACKER ─────────────────────────────────────────────────────────
+#
+# Captures two signals per LAN device:
+#   DNS queries  → reveals every domain name the device resolves (port 53 UDP)
+#   HTTP Host    → reveals the Host header from plain-HTTP requests (port 80)
+#   HTTPS SNI    → reveals the SNI hostname from TLS ClientHello (port 443)
+#
+# Results are stored in the browsing_activity table and served via /browsing.
+# Only traffic whose SOURCE IP belongs to LAN_SUBNET is tracked so we don't
+# log external→external flows that transit the machine.
+
+from scapy.all import DNS, DNSQR, Raw
+
+# Pre-compute network object once for membership tests
+try:
+    _lan_net = ipaddress.ip_network(LAN_SUBNET, strict=False)
+except Exception:
+    _lan_net = None
+
+def _is_lan_ip(ip: str) -> bool:
+    if _lan_net is None:
+        return False
+    try:
+        return ipaddress.ip_address(ip) in _lan_net
+    except ValueError:
+        return False
+
+def _extract_sni(payload: bytes) -> str | None:
+    """Extract SNI hostname from a TLS ClientHello record (best-effort)."""
+    try:
+        # TLS record must start with 0x16 (handshake), version bytes, then length
+        if len(payload) < 5 or payload[0] != 0x16:
+            return None
+        # Handshake type 0x01 = ClientHello
+        if payload[5] != 0x01:
+            return None
+        # Walk past: record header(5) + handshake header(4) + version(2) + random(32)
+        pos = 5 + 4 + 2 + 32
+        if len(payload) < pos + 1:
+            return None
+        # Session ID length
+        sid_len = payload[pos]; pos += 1 + sid_len
+        if len(payload) < pos + 2:
+            return None
+        # Cipher suites length
+        cs_len = int.from_bytes(payload[pos:pos+2], "big"); pos += 2 + cs_len
+        if len(payload) < pos + 1:
+            return None
+        # Compression methods length
+        cm_len = payload[pos]; pos += 1 + cm_len
+        if len(payload) < pos + 2:
+            return None
+        # Extensions length
+        ext_len = int.from_bytes(payload[pos:pos+2], "big"); pos += 2
+        end = pos + ext_len
+        while pos + 4 <= end:
+            ext_type  = int.from_bytes(payload[pos:pos+2], "big")
+            ext_dlen  = int.from_bytes(payload[pos+2:pos+4], "big")
+            pos += 4
+            if ext_type == 0:  # server_name
+                # SNI list length(2) + entry type(1) + name length(2) + name
+                if ext_dlen >= 5:
+                    name_len = int.from_bytes(payload[pos+3:pos+5], "big")
+                    return payload[pos+5:pos+5+name_len].decode("ascii", errors="replace")
+            pos += ext_dlen
+    except Exception:
+        pass
+    return None
+
+def _extract_http_host(payload: bytes) -> str | None:
+    """Extract the Host: header from a raw HTTP request."""
+    try:
+        text = payload.decode("utf-8", errors="replace")
+        for line in text.split("\r\n"):
+            if line.lower().startswith("host:"):
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return None
+
+_browse_lock = threading.Lock()
+
+def _record_browse(src_ip: str, domain: str, protocol: str,
+                   query_type: str = "", dst_ip: str = "",
+                   dst_port: int = 0, url_hint: str = ""):
+    """Write one browsing event to the DB (called from sniffer thread)."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with db_lock:
+        conn.cursor().execute(
+            "INSERT INTO browsing_activity"
+            "(timestamp,source_ip,domain,query_type,dst_ip,dst_port,protocol,url_hint)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            (ts, src_ip, domain, query_type, dst_ip, dst_port, protocol, url_hint)
+        )
+        conn.commit()
+
+def browsing_sniffer():
+    """
+    Separate sniffer thread dedicated to browsing visibility.
+    Captures DNS (udp port 53), HTTP (tcp port 80), HTTPS/TLS SNI (tcp port 443).
+    """
+    print("[BROWSE] Browsing tracker started")
+
+    def handle_browse(pkt):
+        if not pkt.haslayer(IP):
+            return
+        src = pkt[IP].src
+        dst = pkt[IP].dst
+
+        # Only track traffic originating from OUR LAN
+        if not _is_lan_ip(src):
+            return
+
+        # ── DNS ──────────────────────────────────────────────────────
+        if pkt.haslayer(DNS) and pkt.haslayer(DNSQR):
+            try:
+                qname = pkt[DNSQR].qname
+                if isinstance(qname, bytes):
+                    qname = qname.decode("utf-8", errors="replace").rstrip(".")
+                qtype_map = {1:"A",28:"AAAA",5:"CNAME",15:"MX",16:"TXT",33:"SRV"}
+                qtype_int = int(pkt[DNSQR].qtype)
+                qtype = qtype_map.get(qtype_int, str(qtype_int))
+                if qname and not qname.startswith("0."):
+                    _record_browse(src, qname, "DNS", query_type=qtype, dst_ip=dst)
+            except Exception:
+                pass
+            return
+
+        # ── HTTP / HTTPS ─────────────────────────────────────────────
+        if pkt.haslayer(TCP) and pkt.haslayer(Raw):
+            payload = bytes(pkt[Raw].load)
+            dport   = pkt[TCP].dport
+            sport   = pkt[TCP].sport
+
+            # HTTP (port 80) — extract Host header + request path
+            if dport == 80:
+                host = _extract_http_host(payload)
+                if host:
+                    url_hint = ""
+                    try:
+                        first_line = payload.decode("utf-8","replace").split("\r\n")[0]
+                        parts = first_line.split(" ")
+                        if len(parts) >= 2:
+                            url_hint = parts[1][:200]
+                    except Exception:
+                        pass
+                    _record_browse(src, host, "HTTP",
+                                   dst_ip=dst, dst_port=80, url_hint=url_hint)
+
+            # HTTPS / TLS (port 443) — extract SNI from ClientHello
+            elif dport == 443:
+                sni = _extract_sni(payload)
+                if sni:
+                    _record_browse(src, sni, "HTTPS", dst_ip=dst, dst_port=443)
+
+    try:
+        sniff(
+            iface=SNIFF_INTERFACE if SNIFF_INTERFACE != "any" else None,
+            filter="udp port 53 or tcp port 80 or tcp port 443",
+            prn=handle_browse,
+            store=False
+        )
+    except Exception as e:
+        print(f"[BROWSE ERR] Browsing sniffer failed: {e}")
+
+
 # ── PACKET SNIFFER ────────────────────────────────────────────────────────────
 
 def packet_sniffer():
@@ -577,11 +755,74 @@ def unblock_ip():
     iptables_unblock(ip)
     return jsonify({"status":"unblocked","ip":ip})
 
+@app.route("/browsing", methods=["GET"])
+def browsing():
+    """
+    Returns recent browsing activity.
+    Query params:
+      ip     — filter to a specific source IP
+      limit  — max rows (default 300)
+      since  — ISO timestamp, return only rows after this time
+    """
+    ip    = request.args.get("ip","")
+    lim   = int(request.args.get("limit", 300))
+    since = request.args.get("since","")
+    with db_lock:
+        cur = conn.cursor()
+        if ip and since:
+            cur.execute(
+                "SELECT * FROM browsing_activity"
+                " WHERE source_ip=? AND timestamp>?"
+                " ORDER BY id DESC LIMIT ?", (ip, since, lim))
+        elif ip:
+            cur.execute(
+                "SELECT * FROM browsing_activity WHERE source_ip=?"
+                " ORDER BY id DESC LIMIT ?", (ip, lim))
+        elif since:
+            cur.execute(
+                "SELECT * FROM browsing_activity WHERE timestamp>?"
+                " ORDER BY id DESC LIMIT ?", (since, lim))
+        else:
+            cur.execute(
+                "SELECT * FROM browsing_activity ORDER BY id DESC LIMIT ?", (lim,))
+        cols = [d[0] for d in cur.description]
+        return jsonify([dict(zip(cols, r)) for r in cur.fetchall()])
+
+@app.route("/devices_live", methods=["GET"])
+def devices_live():
+    """
+    Returns each LAN device enriched with their last 10 browsed domains
+    and a visit count, so the dashboard can show browsing activity per device.
+    """
+    with _arp_lock:
+        devs = list(_arp_cache)
+    with db_lock:
+        cur = conn.cursor()
+        for dev in devs:
+            ip = dev["ip"]
+            cur.execute(
+                "SELECT domain, protocol, COUNT(*) as visits,"
+                " MAX(timestamp) as last_visit"
+                " FROM browsing_activity WHERE source_ip=?"
+                " GROUP BY domain ORDER BY visits DESC LIMIT 10", (ip,))
+            rows = cur.fetchall()
+            dev["top_domains"] = [
+                {"domain": r[0], "protocol": r[1],
+                 "visits": r[2], "last_visit": r[3]}
+                for r in rows
+            ]
+            cur.execute(
+                "SELECT COUNT(*) FROM browsing_activity WHERE source_ip=?", (ip,))
+            dev["total_requests"] = (cur.fetchone() or [0])[0]
+    return jsonify(devs)
+
+
+
 @app.route("/devices", methods=["GET"])
 def devices():
     with _arp_lock: return jsonify(list(_arp_cache))
 
-@app.route("/alerts", methods=["GET"])
+
 def alerts():
     lim = int(request.args.get("limit",200))
     with db_lock:
@@ -628,9 +869,10 @@ def status():
 
 if __name__ == "__main__":
     try:
-        threading.Thread(target=worker,         daemon=True,name="worker").start()
-        threading.Thread(target=flow_flusher,   daemon=True,name="flusher").start()
-        threading.Thread(target=packet_sniffer, daemon=True,name="sniffer").start()
+        threading.Thread(target=worker,           daemon=True,name="worker").start()
+        threading.Thread(target=flow_flusher,     daemon=True,name="flusher").start()
+        threading.Thread(target=packet_sniffer,   daemon=True,name="sniffer").start()
+        threading.Thread(target=browsing_sniffer, daemon=True,name="browse").start()
         if IPTABLES_ENABLED:
             threading.Thread(target=arp_scan,   daemon=True,name="arp").start()
         else:
@@ -654,3 +896,4 @@ if __name__ == "__main__":
 
 
 #MAXIDMINDPASS: Fearless##8882
+#update geoipupdate -f GeoIP.conf before run the files to update the db 
